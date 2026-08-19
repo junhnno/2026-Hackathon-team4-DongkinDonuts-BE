@@ -145,7 +145,17 @@ REST_FRAMEWORK = {
     "EXCEPTION_HANDLER": "common.exceptions.custom_exception_handler",
 }
 
+# 로컬 개발(DEBUG=True)에서는 프론트 origin이 자주 바뀌니 전체 허용, 배포 환경에서는
+# 실제 프론트 도메인만 명시적으로 허용한다(CORS_ALLOW_ALL_ORIGINS=True로 두면 배포에서도
+# 아무 origin이나 다 받아버려서 위험함).
 CORS_ALLOW_ALL_ORIGINS = DEBUG
+CORS_ALLOWED_ORIGINS = env.list(
+    "CORS_ALLOWED_ORIGINS",
+    default=[
+        "https://dgu14thlikelion.shop",
+        "https://www.dgu14thlikelion.shop",
+    ],
+)
 
 # OpenAI LLM plan generation.
 # Team convention uses OPEN_AI_API_KEY; OPENAI_API_KEY is accepted only as a
