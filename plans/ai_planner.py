@@ -1125,6 +1125,7 @@ def _persist_ai_plan(
     normalized_slots,
     notification_enabled,
     generator_name=POLICY_GENERATOR_NAME,
+    use_ai_decision=False,
 ):
     ai_run = AIPlanRun.objects.create(
         user=user,
@@ -1147,10 +1148,14 @@ def _persist_ai_plan(
         ],
         notification_enabled=notification_enabled,
         ai_plan_run=ai_run,
+        use_ai_decision=use_ai_decision,
     )
     _create_plan_insights(plan, ai_output)
 
-    slots = list(plan.slots.order_by("sequence_no"))
+    # plan.slots는 이제(플랜을 재사용하면서) 다른 흐름의 기존 열린 슬롯까지
+    # 섞여 있을 수 있다 — 방금 이 호출에서 만든 슬롯만 골라야 한다. 매 호출마다
+    # 새로 만드는 ai_run으로 필터링하면 정확히 그것만 남는다.
+    slots = list(plan.slots.filter(ai_plan_run=ai_run).order_by("sequence_no"))
     for slot, ai_slot in zip(slots, normalized_slots):
         slot.interval_minutes = ai_slot["interval_minutes"]
         slot.save(update_fields=["interval_minutes", "updated_at"])
@@ -1288,6 +1293,7 @@ def generate_ai_recovery_plan(
         normalized_slots=normalized_slots,
         notification_enabled=notification_enabled,
         generator_name=generator_name,
+        use_ai_decision=use_ai_decision,
     )
 
     return plan

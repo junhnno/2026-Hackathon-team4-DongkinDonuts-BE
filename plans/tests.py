@@ -46,6 +46,7 @@ from .models import (
     WebPushSubscription,
 )
 from .services import (
+    OPEN_SLOT_STATUSES,
     build_policy_recommended_slots,
     create_or_replace_today_plan,
     has_today_pc_usage_pattern,
@@ -286,7 +287,12 @@ class RecoveryPlanServiceTests(TestCase):
         self.assertEqual(slot.notifications.filter(status=NotificationStatus.PENDING).count(), 1)
         self.assertEqual(reengagement.status, NotificationStatus.CANCELED)
 
-    def test_replacing_today_plan_cancels_previous_open_slots_and_notifications(self):
+    def test_replacing_today_plan_cancels_previous_open_slots_of_the_same_flow(self):
+        # 같은 흐름(둘 다 use_ai_decision 생략 = None)으로 다시 생성하면, 예전
+        # 열린 슬롯은 FREQUENCY든 SNAPSHOT이든 basis 상관없이 전부 취소되고,
+        # 더 이상 "FREQUENCY만 예외로 부활"시키지 않는다 — 그 "부활" 로직이
+        # 바로 "PC 사용 패턴에서 블록을 지웠는데 그 블록 알림이 안 사라지는"
+        # 버그의 원인이었다.
         frequency_time = timezone.now() + timedelta(minutes=70)
         old_plan = create_or_replace_today_plan(
             user=self.user,
@@ -316,18 +322,64 @@ class RecoveryPlanServiceTests(TestCase):
         old_plan.refresh_from_db()
         old_snapshot.refresh_from_db()
         old_frequency.refresh_from_db()
-        self.assertEqual(old_plan.status, PlanStatus.REPLACED)
+        # 같은 흐름은 새로 만들지 않고 오늘의 active plan을 그대로 재사용한다.
+        self.assertEqual(new_plan.id, old_plan.id)
+        self.assertEqual(new_plan.status, PlanStatus.ACTIVE)
         self.assertEqual(old_snapshot.status, SlotStatus.CANCELED)
         self.assertEqual(old_frequency.status, SlotStatus.CANCELED)
         self.assertEqual(old_snapshot.notifications.filter(status=NotificationStatus.PENDING).count(), 0)
         self.assertEqual(old_frequency.notifications.filter(status=NotificationStatus.PENDING).count(), 0)
-        self.assertEqual(new_plan.status, PlanStatus.ACTIVE)
-        self.assertTrue(
-            new_plan.slots.filter(
+        # 예전 FREQUENCY 슬롯 시각에 "새로" 만들어진 슬롯이 없다 — 취소된
+        # old_frequency 자기 자신은 여전히 plan에 남아있으니 그건 제외하고 본다.
+        self.assertFalse(
+            new_plan.slots.exclude(id=old_frequency.id)
+            .filter(
                 notification_basis=SlotNotificationBasis.FREQUENCY,
                 recommended_at=old_frequency.effective_time,
-            ).exists()
+            )
+            .exists()
         )
+
+    def test_regenerating_other_flow_does_not_cancel_this_flows_open_slots(self):
+        # 상태 선택 모달(use_ai_decision=False)로 만든 알림은, My Digital State
+        # 흐름(use_ai_decision=True)이 재생성돼도 건드리면 안 된다 — 두 흐름은
+        # 완전히 독립적이어야 한다.
+        modal_plan = create_or_replace_today_plan(
+            user=self.user,
+            context_snapshot=self.context_snapshot,
+            next_activity_plan=self.next_activity_plan,
+            recommended_times=[timezone.now() + timedelta(minutes=30)],
+            use_ai_decision=False,
+        )
+        modal_slot = modal_plan.slots.get()
+
+        digital_plan = create_or_replace_today_plan(
+            user=self.user,
+            context_snapshot=self.context_snapshot,
+            next_activity_plan=self.next_activity_plan,
+            recommended_times=[timezone.now() + timedelta(minutes=45)],
+            use_ai_decision=True,
+        )
+
+        modal_slot.refresh_from_db()
+        # 하루 한 plan을 공유해서 재사용하지만, 모달 슬롯은 취소되지 않는다.
+        self.assertEqual(digital_plan.id, modal_plan.id)
+        self.assertIn(modal_slot.status, OPEN_SLOT_STATUSES)
+        self.assertEqual(modal_slot.notifications.filter(status=NotificationStatus.PENDING).count(), 1)
+
+        # 이번엔 반대로 모달을 다시 완료해도, PC 패턴 흐름이 만든 슬롯은 그대로.
+        digital_slot = digital_plan.slots.exclude(id=modal_slot.id).get()
+        create_or_replace_today_plan(
+            user=self.user,
+            context_snapshot=self.context_snapshot,
+            next_activity_plan=self.next_activity_plan,
+            recommended_times=[timezone.now() + timedelta(minutes=20)],
+            use_ai_decision=False,
+        )
+        digital_slot.refresh_from_db()
+        modal_slot.refresh_from_db()
+        self.assertEqual(modal_slot.status, SlotStatus.CANCELED)
+        self.assertIn(digital_slot.status, OPEN_SLOT_STATUSES)
 
     @patch("plans.web_push.send_web_push")
     def test_send_due_notifications_sends_pending_notification_to_active_subscriptions(self, mock_send_web_push):
@@ -924,7 +976,13 @@ class RecoveryPlanApiTests(APITestCase):
             default_duration_sec=90,
         )
         fixed_now = timezone.now().replace(hour=8, minute=0, second=0, microsecond=0)
-        history_plan = RecoveryPlan.objects.create(user=user, plan_date=today_for_user(user))
+        # history_plan/history_slot은 "3주 전 완료했던 세션"을 매달아두기 위한
+        # 껍데기일 뿐, 오늘의 실제 active plan을 흉내내려는 게 아니다. status를
+        # 그대로 ACTIVE로 두면(기본값) 뒤에서 today/ai-generate가 오늘의 plan을
+        # 재사용하는 로직과 충돌해서 이 더미 슬롯까지 오늘 plan에 섞여버린다.
+        history_plan = RecoveryPlan.objects.create(
+            user=user, plan_date=today_for_user(user), status=PlanStatus.REPLACED
+        )
         history_slot = RecoverySlot.objects.create(
             recovery_plan=history_plan,
             sequence_no=1,
@@ -1257,7 +1315,10 @@ class RecoveryPlanApiTests(APITestCase):
             )
 
         self.assertEqual(body_response.status_code, status.HTTP_201_CREATED)
-        body_first_slot = body_response.data["data"]["slots"][0]
+        # 두 흐름 독립성 때문에 오늘의 plan을 재사용하므로, 이전(EYE) 호출의
+        # 슬롯이 앞쪽 sequence_no로 여전히 남아있다 — 방금 새로 만든 슬롯은
+        # 항상 마지막(가장 큰 sequence_no)이다.
+        body_first_slot = body_response.data["data"]["slots"][-1]
         self.assertEqual(
             [routine["activity"]["code"] for routine in body_first_slot["routine_instances"]],
             [

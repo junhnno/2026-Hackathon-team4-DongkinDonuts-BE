@@ -165,6 +165,12 @@ class RecoverySlot(BaseModel):
         default=SlotNotificationBasis.SNAPSHOT,
     )
     status = models.CharField(max_length=20, choices=SlotStatus.choices, default=SlotStatus.RECOMMENDED)
+    # 상태 선택 모달(False)과 My Digital State(True) 중 이 슬롯을 만든 흐름.
+    # 두 흐름은 완전히 독립적이어야 해서(한쪽을 재생성해도 다른 쪽 알림은 그대로),
+    # 하루치 RecoveryPlan을 재사용하게 되면서 "이 슬롯이 어느 흐름 소속인지"를
+    # 슬롯 단위로 알아야만 재생성 시 같은 흐름의 슬롯만 골라 취소할 수 있다.
+    # None은 두 흐름을 거치지 않은 레거시/수동 생성 슬롯.
+    use_ai_decision = models.BooleanField(null=True, blank=True, default=None)
 
     class Meta:
         ordering = ["recovery_plan", "sequence_no"]

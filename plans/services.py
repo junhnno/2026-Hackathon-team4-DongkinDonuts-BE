@@ -634,27 +634,6 @@ def _merge_recommended_slot(slots_by_time, *, recommended_at, notification_basis
             existing["data_sources"].append(source)
 
 
-def _slot_input_time_key(slot_input):
-    recommended_at = slot_input.get("recommended_at")
-    return _minute_floor(recommended_at) if recommended_at else None
-
-
-def _append_slot_input(slot_inputs, slot_input):
-    key = _slot_input_time_key(slot_input)
-    if key is None:
-        slot_inputs.append(slot_input)
-        return
-
-    for existing in slot_inputs:
-        if _slot_input_time_key(existing) != key:
-            continue
-        if slot_input.get("notification_basis") == SlotNotificationBasis.FREQUENCY:
-            existing["notification_basis"] = SlotNotificationBasis.FREQUENCY
-        if "notification_enabled" in slot_input and "notification_enabled" not in existing:
-            existing["notification_enabled"] = slot_input["notification_enabled"]
-        return
-
-    slot_inputs.append(slot_input)
 
 
 def build_policy_recommended_slots(
@@ -833,11 +812,17 @@ def create_or_replace_today_plan(
     recommended_slots=None,
     notification_enabled=True,
     ai_plan_run=None,
+    use_ai_decision=None,
 ):
     """
-    오늘 active RecoveryPlan을 새로 만든다.
+    오늘 RecoveryPlan을 만들거나(없으면) 이어서 쓴다(있으면).
 
-    기존 active plan은 REPLACED로 닫고 새 plan을 만든다.
+    상태 선택 모달 흐름(use_ai_decision=False/None)과 My Digital State 흐름
+    (use_ai_decision=True)은 완전히 독립적이어야 한다 — 한쪽을 다시 생성해도
+    다른 쪽이 이미 예약해둔 알림은 건드리면 안 된다. 그래서 예전처럼 "오늘 active
+    plan을 통째로 닫고 새로 만드는" 대신, 오늘 하루엔 active plan을 하나만
+    재사용하면서 "이번 생성과 같은 흐름으로 만들어졌던 열린 슬롯"만 취소하고
+    다른 흐름의 슬롯은 그대로 둔다.
 
     recommended_times는 기존 호출부 호환용이고, 슬롯마다 알림 basis를 지정해야 하는 정책 생성
     흐름은 recommended_slots를 사용한다.
@@ -846,7 +831,6 @@ def create_or_replace_today_plan(
     validate_context_inputs(user, context_snapshot, next_activity_plan)
 
     plan_date = today_for_user(user)
-    now = timezone.now()
     active_plans = list(
         RecoveryPlan.objects.select_for_update().filter(
             user=user,
@@ -854,33 +838,29 @@ def create_or_replace_today_plan(
             status=PlanStatus.ACTIVE,
         )
     )
-    preserved_frequency_slot_inputs = []
+
     for active_plan in active_plans:
-        for slot in _open_slots_for_plan(
-            active_plan,
-            notification_basis=SlotNotificationBasis.FREQUENCY,
-        ).order_by("effective_at", "sequence_no"):
-            if slot.effective_time and slot.effective_time >= now:
-                preserved_frequency_slot_inputs.append(
-                    {
-                        "recommended_at": slot.effective_time,
-                        "notification_basis": SlotNotificationBasis.FREQUENCY,
-                        "notification_enabled": slot.notification_enabled,
-                    }
-                )
-        _cancel_open_slots(
-            _open_slots_for_plan(active_plan).order_by("effective_at", "sequence_no")
-        )
-        active_plan.status = PlanStatus.REPLACED
-        active_plan.save(update_fields=["status", "updated_at"])
+        same_flow_open_slots = _open_slots_for_plan(active_plan).filter(use_ai_decision=use_ai_decision)
+        _cancel_open_slots(same_flow_open_slots.order_by("effective_at", "sequence_no"))
 
     generation_snapshot = build_plan_generation_snapshot(user, context_snapshot, next_activity_plan)
-    plan = RecoveryPlan.objects.create(
-        user=user,
-        ai_plan_run=ai_plan_run,
-        plan_date=plan_date,
-        generation_snapshot_json=generation_snapshot,
-    )
+    plan = active_plans[0] if active_plans else None
+    if plan is None:
+        plan = RecoveryPlan.objects.create(
+            user=user,
+            ai_plan_run=ai_plan_run,
+            plan_date=plan_date,
+            generation_snapshot_json=generation_snapshot,
+        )
+    else:
+        # 유니크 제약상 동시에 active plan이 여러 개일 순 없지만, 방어적으로
+        # 남는 게 있으면 닫아둔다.
+        for extra_plan in active_plans[1:]:
+            extra_plan.status = PlanStatus.REPLACED
+            extra_plan.save(update_fields=["status", "updated_at"])
+        plan.ai_plan_run = ai_plan_run
+        plan.generation_snapshot_json = generation_snapshot
+        plan.save(update_fields=["ai_plan_run", "generation_snapshot_json", "updated_at"])
 
     slot_inputs = list(recommended_slots or [])
     if not slot_inputs:
@@ -898,8 +878,6 @@ def create_or_replace_today_plan(
                 "notification_basis": notification_basis_for_plan(plan),
             }
         ]
-    for slot_input in preserved_frequency_slot_inputs:
-        _append_slot_input(slot_inputs, slot_input)
 
     for slot_input in slot_inputs:
         create_recovery_slot(
@@ -910,6 +888,7 @@ def create_or_replace_today_plan(
             notification_enabled=slot_input.get("notification_enabled", notification_enabled),
             notification_basis=slot_input.get("notification_basis") or notification_basis_for_plan(plan),
             ai_plan_run=ai_plan_run,
+            use_ai_decision=use_ai_decision,
         )
     return plan
 
@@ -924,6 +903,7 @@ def create_recovery_slot(
     notification_enabled=True,
     notification_basis=None,
     ai_plan_run=None,
+    use_ai_decision=None,
 ):
     validate_context_inputs(plan.user, context_snapshot, next_activity_plan)
 
@@ -950,6 +930,7 @@ def create_recovery_slot(
         ),
         notification_enabled=notification_enabled,
         notification_basis=notification_basis,
+        use_ai_decision=use_ai_decision,
     )
     sync_slot_notification(slot)
     return slot
