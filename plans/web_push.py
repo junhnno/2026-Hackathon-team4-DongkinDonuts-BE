@@ -61,14 +61,15 @@ def subscription_info(subscription):
 
 def build_web_push_payload(notification):
     title = "회복 세션 알림"
+    # 알림을 눌렀을 때 특정 라우트(/handroutine 등)로 보내는 대신, 그냥 사이트
+    # 첫 화면으로 이동시킨다 — 오늘의 회복 계획/루틴이 이미 랜딩 페이지에서
+    # 다 보이기 때문에 별도 진입점이 필요 없다는 판단.
     url = "/"
     recovery_slot_id = None
     if notification.kind == NotificationKind.REENGAGEMENT:
         title = "회복 루틴 다시 시작하기"
     if notification.recovery_slot_id:
         recovery_slot_id = str(notification.recovery_slot_id)
-        # /recovery-slots/{id} 라우트는 프론트에 없다 — 회복 루틴 시작 페이지로 보낸다.
-        url = "/handroutine"
     if notification.data_json.get("url"):
         url = notification.data_json["url"]
 
